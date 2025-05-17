@@ -201,6 +201,9 @@ fn is_excluded_local_file(local_path: &Path) -> bool {
 
 fn copy_file(client: &Sftp, remote_path: &Path, local_path: &Path) -> anyhow::Result<()> {
     println!("Copying remote file {remote_path:?} to {local_path:?}");
+    if let Some(parent) = local_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut remote_file = client.open(remote_path)?;
     let mut local_file = File::create(local_path)?;
     let mut buffer = vec![0; BUFFER_SIZE];
