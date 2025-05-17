@@ -1,14 +1,50 @@
+mod local;
+mod remote;
+
+use crate::local::find_local_files;
+use crate::remote::find_remote_files;
 use clap::Parser;
 use rayon::prelude::*;
 use ssh2::{Session, Sftp};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::exit;
 
 const BUFFER_SIZE: usize = 1024 * 128;
-const CLEAR_LINE: &str = "\x1B[2K";
+pub const CLEAR_LINE: &str = "\x1B[2K";
+
+fn main() -> anyhow::Result<()> {
+    ctrlc::set_handler(terminate)?;
+    hide_cursor();
+    let mut args = Args::parse();
+    args.exclude.sort();
+    if args.password.is_empty() {
+        match rpassword::prompt_password(format!("SFTP Password for {}: ", args.username)) {
+            Ok(inner) => args.password = inner,
+            Err(error) => {
+                println!("Error getting password from user. {error}");
+                show_cursor()
+            }
+        }
+    }
+    
+    let sftp = match create_sftp_connection(&args.ip, args.port, &args.username, &args.password) {
+        Ok(inner) => inner,
+        Err(error) => {
+            println!("Error attempting to create an SFTP connection. {error}");
+            show_cursor()
+        }
+    };
+    if let Err(error) = sync_local_directory(sftp, &args) {
+        println!(
+            "Error syncing local directory {:?} with remote directory {:?}. {error}\n",
+            args.local_directory, args.remote_directory
+        );
+    }
+    show_cursor()
+}
 
 fn hide_cursor() {
     print!("\x1B[?25l")
@@ -28,137 +64,160 @@ struct Args {
     port: u16,
     #[arg(long)]
     username: String,
-    #[arg(long)]
-    password: Option<String>,
-    #[arg(long)]
-    exclude: Option<Vec<String>>,
-    #[arg(short, long)]
-    local_directory: PathBuf,
-    #[arg(short, long)]
-    remote_directory: PathBuf,
-}
-
-struct SftpSync {
-    client: Sftp,
+    #[arg(long, default_value_t = String::new())]
+    password: String,
+    #[arg(long, default_values_t = &[])]
     exclude: Vec<String>,
+    #[arg(short, long)]
     local_directory: PathBuf,
+    #[arg(short, long)]
     remote_directory: PathBuf,
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
-impl SftpSync {
-    pub fn new<P: AsRef<Path>, Q: AsRef<Path>>(
-        client: Sftp,
-        exclude: Option<Vec<String>>,
-        local_directory: P,
-        remote_directory: Q,
-    ) -> Self {
-        let exclude = if let Some(mut e) = exclude {
-            e.sort();
-            e
-        } else {
-            Default::default()
+trait VecExt<T>
+where
+    T: PartialEq,
+{
+    fn index_of(&self, item: &T) -> Option<usize>;
+
+    fn remove_first(&mut self, item: &T) -> Option<T>;
+}
+
+impl<T> VecExt<T> for Vec<T>
+where
+    T: PartialEq,
+{
+    fn index_of(&self, item: &T) -> Option<usize> {
+        self.iter()
+            .enumerate()
+            .find(|(_, e)| *e == item)
+            .map(|(i, _)| i)
+    }
+
+    fn remove_first(&mut self, item: &T) -> Option<T> {
+        let Some(i) = self.index_of(item) else {
+            return None;
         };
-        Self {
-            client,
-            exclude,
-            local_directory: local_directory.as_ref().to_path_buf(),
-            remote_directory: remote_directory.as_ref().to_path_buf(),
-        }
+        Some(self.remove(i))
     }
+}
 
-    fn copy_file(
-        &self,
-        remote_path: &Path,
-        local_path: &Path,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        println!("Copying remote file {remote_path:?} to {local_path:?}");
-        let mut remote_file = self.client.open(remote_path)?;
-        let mut local_file = File::create(local_path)?;
-        let mut buffer = vec![0; BUFFER_SIZE];
-        loop {
-            let bytes_read = remote_file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
+enum SyncEntry {
+    Copy {
+        local_path: PathBuf,
+        remote_path: PathBuf,
+    },
+    Delete {
+        local_path: PathBuf,
+    },
+}
+
+fn sync_local_directory(client: Sftp, args: &Args) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&args.local_directory)?;
+
+    let mut paths = Vec::new();
+    println!("Finding paths to files that need to be added, replaced or removed.");
+    find_paths(&client, &args, &mut paths)?;
+
+    println!("\nNeed to update {} files", paths.len());
+    paths
+        .into_par_iter()
+        .for_each(|sync_entry| match sync_entry {
+            SyncEntry::Copy {
+                remote_path,
+                local_path,
+            } => {
+                if args.dry_run {
+                    println!("Copying {remote_path:?} -> {local_path:?}");
+                    return;
+                }
+                if let Err(error) = copy_file(&client, &remote_path, &local_path) {
+                    println!("Error copying file {remote_path:?} -> {local_path:?}. {error}");
+                }
             }
-            local_file.write_all(&buffer[0..bytes_read])?;
-        }
-        Ok(())
-    }
-
-    fn find_paths<P: AsRef<Path>, Q: AsRef<Path>>(
-        &self,
-        local_directory: P,
-        remote_directory: Q,
-        result: &mut Vec<(PathBuf, PathBuf)>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let local_directory = local_directory.as_ref();
-        let remote_directory = remote_directory.as_ref();
-        std::fs::create_dir_all(local_directory)?;
-        for (path, stat) in self.client.readdir(remote_directory)? {
-            let Some(file_name) = path.file_name().and_then(|p| p.to_str()) else {
-                println!(
-                    "{CLEAR_LINE}\rCould not extract file name from remote path {path:?}. Skipping to next item."
-                );
-                continue;
-            };
-
-            if self
-                .exclude
-                .binary_search_by(|e| e.as_str().cmp(file_name))
-                .is_ok()
-            {
-                println!("{CLEAR_LINE}\rSkipping excluded file/directory {file_name}");
-                continue;
-            }
-
-            if stat.is_dir() {
-                let child_local_dir = local_directory.join(file_name);
-                self.find_paths(child_local_dir, path, result)?;
-                continue;
-            }
-
-            print!("{CLEAR_LINE}\rChecking {path:?} for a download or replace");
-
-            let Some(remote_size) = &stat.size else {
-                println!(
-                    "{CLEAR_LINE}\rCould not extract file size from the remote path {path:?}. Skipping to next item"
-                );
-                continue;
-            };
-
-            let local_path = local_directory.join(file_name);
-            if !local_path.exists() {
-                result.push((path, local_path));
-                continue;
-            }
-
-            let local_file = File::open(&local_path)?;
-            if local_file.metadata()?.len() != *remote_size {
-                result.push((path, local_path));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn sync_local_directory(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.local_directory.exists() {
-            return Err(
-                format!("Local directory {:?} does not exist", self.local_directory).into(),
-            );
-        }
-        let mut paths = Vec::new();
-        println!("Finding paths that need to files that needs to be added or replaced.");
-        self.find_paths(&self.local_directory, &self.remote_directory, &mut paths)?;
-        print!("{CLEAR_LINE}\r");
-
-        println!("Need to update {} files", paths.len());
-        paths.into_par_iter().for_each(|(remote_path, local_path)| {
-            if let Err(error) = self.copy_file(&remote_path, &local_path) {
-                println!("Error copying file {remote_path:?} -> {local_path:?}. {error}");
+            SyncEntry::Delete { local_path } => {
+                if args.dry_run {
+                    println!("Delete {local_path:?}");
+                    return;
+                }
+                if let Err(error) = delete_local_file(&local_path) {
+                    println!("Error deleting file {local_path:?}. {error}");
+                }
             }
         });
-        Ok(())
+    Ok(())
+}
+
+fn find_paths(client: &Sftp, args: &Args, result: &mut Vec<SyncEntry>) -> anyhow::Result<()> {
+    println!("Finding local files");
+    let mut local_files = find_local_files(&args.local_directory, &args.exclude)?;
+    println!("{CLEAR_LINE}\rFinding remote files");
+    let remote_files = find_remote_files(client, &args.remote_directory, &args.exclude)?;
+
+    println!("{CLEAR_LINE}\rComparing local vs remote files");
+    for (remote_file, remote_size) in remote_files {
+        if let Some(local_path) = local_files.remove_first(&remote_file) {
+            let local_file = File::open(args.local_directory.join(&local_path))?;
+            if local_file.metadata()?.len() != remote_size {
+                result.push(SyncEntry::Copy {
+                    remote_path: args.remote_directory.join(remote_file),
+                    local_path: args.local_directory.join(local_path),
+                });
+            }
+            continue;
+        }
+
+        result.push(SyncEntry::Copy {
+            remote_path: args.remote_directory.join(&remote_file),
+            local_path: args.local_directory.join(remote_file),
+        })
     }
+
+    for local_file in local_files {
+        if is_excluded_local_file(&local_file) {
+            continue;
+        }
+        result.push(SyncEntry::Delete {
+            local_path: args.local_directory.join(local_file),
+        })
+    }
+
+    Ok(())
+}
+
+fn is_excluded_local_file(local_path: &Path) -> bool {
+    local_path.components().any(|c| {
+        let Component::Normal(part) = c else {
+            return false;
+        };
+        let Some(part) = part.to_str() else {
+            return false;
+        };
+        part.starts_with(".Trash")
+    })
+}
+
+fn copy_file(client: &Sftp, remote_path: &Path, local_path: &Path) -> anyhow::Result<()> {
+    println!("Copying remote file {remote_path:?} to {local_path:?}");
+    let mut remote_file = client.open(remote_path)?;
+    let mut local_file = File::create(local_path)?;
+    let mut buffer = vec![0; BUFFER_SIZE];
+    loop {
+        let bytes_read = remote_file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        local_file.write_all(&buffer[0..bytes_read])?;
+    }
+    Ok(())
+}
+
+fn delete_local_file(local_path: &Path) -> anyhow::Result<()> {
+    println!("Deleting local file {local_path:?}");
+    std::fs::remove_file(&local_path)?;
+    Ok(())
 }
 
 fn create_sftp_connection(
@@ -180,46 +239,4 @@ fn create_sftp_connection(
 fn terminate() {
     println!("\nHandling SIGTERM");
     show_cursor();
-}
-
-fn main() {
-    if let Err(error) = ctrlc::set_handler(terminate) {
-        println!("Failed to set handler for SIGTERM. {error}");
-        return;
-    }
-    hide_cursor();
-    let args = Args::parse();
-    let password = match args.password {
-        Some(inner) => inner,
-        None => {
-            match rpassword::prompt_password(format!("SFTP Password for {}: ", args.username)) {
-                Ok(inner) => inner,
-                Err(error) => {
-                    println!("Error getting password from user. {error}");
-                    show_cursor()
-                }
-            }
-        }
-    };
-    let sftp = match create_sftp_connection(&args.ip, args.port, &args.username, &password) {
-        Ok(inner) => inner,
-        Err(error) => {
-            println!("Error attempting to create an SFTP connection. {error}");
-            show_cursor()
-        }
-    };
-    let sync = SftpSync::new(
-        sftp,
-        args.exclude,
-        &args.local_directory,
-        &args.remote_directory,
-    );
-    if let Err(error) = sync.sync_local_directory() {
-        println!(
-            "Error syncing local directory {:?} with remote directory {:?}. {error}\n",
-            args.local_directory, args.remote_directory
-        );
-        show_cursor()
-    }
-    show_cursor()
 }
